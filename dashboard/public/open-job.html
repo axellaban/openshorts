@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Abriendo job…</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0a0a0c; color:#e4e4e7;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,sans-serif; }
+  .box { max-width:520px; padding:32px; text-align:center; }
+  h1 { font-size:18px; margin:0 0 10px; }
+  code { background:#1c1c20; padding:2px 6px; border-radius:5px; font-size:13px; }
+  .err { color:#f87171; }
+  .hint { color:#a1a1aa; font-size:13px; margin-top:14px; }
+  a { color:#8b5cf6; }
+</style>
+</head>
+<body>
+<div class="box" id="out"><h1>Abriendo el job…</h1></div>
+<script>
+// Reabre un job terminado en el dashboard.
+//
+// En self-host el dashboard no puede reabrir jobs pasados: /api/history,
+// /api/projects y /api/projects/{id}/restore son cloud-only y devuelven 404
+// cuando BILLING_ENABLED es falso. Lo único que queda es la recuperación de
+// sesión de App.jsx, que lee localStorage['openshorts_session'] al montar.
+//
+// Esta página se sirve desde public/, o sea el MISMO origen que el dashboard,
+// que es justo lo que hace falta: localStorage está aislado por origen, así que
+// una página en otro puerto no podría escribirlo.
+//
+//   /open-job.html?job=<job_id>
+const API = 'http://localhost:8000';
+const SESSION_KEY = 'openshorts_session';
+const out = document.getElementById('out');
+
+const fail = (msg, hint) => {
+  out.innerHTML = '<h1 class="err">No se pudo abrir</h1><p>' + msg + '</p>' +
+                  (hint ? '<p class="hint">' + hint + '</p>' : '');
+};
+
+(async () => {
+  const id = new URLSearchParams(location.search).get('job');
+  if (!id) return fail('Falta el parámetro <code>job</code>.',
+                       'Usalo así: <code>/open-job.html?job=&lt;job_id&gt;</code>');
+
+  let data;
+  try {
+    const res = await fetch(API + '/api/status/' + encodeURIComponent(id));
+    if (!res.ok) return fail('El server respondió ' + res.status + ' para ese job.',
+                             'Los jobs se borran a las 24 h. ¿El id es correcto?');
+    data = await res.json();
+  } catch (e) {
+    return fail('No pude hablar con el backend en <code>' + API + '</code>.',
+                'Levantalo con <code>./server.sh start</code>.');
+  }
+
+  if (data.status !== 'completed')
+    return fail('El job está en <code>' + data.status + '</code>, todavía no terminó.');
+  const result = data.result;
+  if (!result || !(result.clips || []).length) return fail('El job no tiene clips.');
+
+  // Ojo: el front usa 'complete' y la API 'completed'. No es el mismo vocabulario;
+  // con el de la API la sesión no monta.
+  localStorage.setItem(SESSION_KEY, JSON.stringify({
+    jobId: id,
+    status: 'complete',
+    results: result,
+    processingMedia: { type: 'server', payload: '/api/source/' + id },
+    activeTab: 'dashboard',
+    noSource: false,
+    projectState: null,
+    timestamp: Date.now(),
+  }));
+  localStorage.setItem('openshorts_skip_landing', '1');   // saltear la landing
+
+  out.innerHTML = '<h1>' + result.clips.length + ' clips listos</h1><p>Abriendo el editor…</p>';
+  location.replace('/#app');
+})();
+</script>
+</body>
+</html>

@@ -221,6 +221,13 @@ function App() {
     if (stored) return decrypt(stored);
     return '';
   });
+  // Deepgram API State - Load encrypted
+  const [deepgramKey, setDeepgramKey] = useState(() => {
+    const stored = localStorage.getItem('deepgramKey_v1');
+    if (stored) return decrypt(stored);
+    return 'ec86dbfdb7a737409d06dfb6f01836cbce2dc1a0';
+  });
+  const [deepgramSaved, setDeepgramSaved] = useState(false);
 
   // fal.ai API State - Load encrypted
   const [falKey, setFalKey] = useState(() => {
@@ -681,12 +688,16 @@ function App() {
   // silent: background auto-fetch — never alert(), just log. Managed users need
   // no local key (the server resolves its own); BYOK sends the header.
   const fetchUserProfiles = async ({ silent = false } = {}) => {
-    if (!uploadPostKey && !isManaged) return;
+    const keyToUse = uploadPostKey ? uploadPostKey.trim() : '';
+    if (!keyToUse && !isManaged) return;
     try {
       const res = await apiFetch('/api/social/user', {
-        headers: uploadPostKey ? { 'X-Upload-Post-Key': uploadPostKey } : {}
+        headers: keyToUse ? { 'X-Upload-Post-Key': keyToUse } : {}
       });
-      if (!res.ok) throw new Error("Failed to fetch");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Server returned ${res.status}`);
+      }
       const data = await res.json();
       if (data.profiles && data.profiles.length > 0) {
         setUserProfiles(data.profiles);
@@ -694,11 +705,14 @@ function App() {
         if (!uploadUserId) {
           setUploadUserId(data.profiles[0].username);
         }
+        if (!silent) {
+          alert(`✅ Conectado exitosamente con Upload-Post.\nPerfiles encontrados: ${data.profiles.map(p => p.username).join(', ')}`);
+        }
       } else if (!silent) {
-        alert("No profiles found for this API Key.");
+        alert("No profiles found for this API Key. Please create a profile at app.upload-post.com.");
       }
     } catch (e) {
-      if (!silent) alert("Error fetching User Profiles. Please check key.");
+      if (!silent) alert(`Error fetching User Profiles: ${e.message}`);
       console.error(e);
     }
   };
@@ -1347,6 +1361,45 @@ function App() {
 
                 </>
               )}
+
+              <div className="card p-4 sm:p-6 mt-8">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-input bg-paper3 flex items-center justify-center shrink-0">
+                      <Sparkles size={16} className="text-brass" />
+                    </div>
+                    <h2 className="text-base font-medium text-ink lowercase">Deepgram Transcription</h2>
+                  </div>
+                  <span className="badge-ok">ACTIVE</span>
+                </div>
+                <p className="text-xs text-muted mb-6 leading-relaxed">
+                  Used for <strong>ultra-fast audio transcription &amp; subtitles</strong> via Deepgram Nova-2 model.
+                </p>
+                <div className="space-y-4">
+                  <label className="block text-sm text-muted">Deepgram API Key</label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      type="password"
+                      value={deepgramKey}
+                      onChange={(e) => setDeepgramKey(e.target.value)}
+                      className="input-field"
+                      placeholder="ec86..."
+                    />
+                    <button
+                      onClick={() => {
+                        if (deepgramKey) {
+                          localStorage.setItem('deepgramKey_v1', encrypt(deepgramKey));
+                          setDeepgramSaved(true);
+                          setTimeout(() => setDeepgramSaved(false), 2000);
+                        }
+                      }}
+                      className={deepgramSaved ? 'badge-ok px-4' : 'btn-quiet py-2 px-4 text-sm'}
+                    >
+                      {deepgramSaved ? <><Check size={12} /> saved</> : 'Save'}
+                    </button>
+                  </div>
+                </div>
+              </div>
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">

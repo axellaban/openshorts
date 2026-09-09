@@ -30,6 +30,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import httpx
 
 from subtitles import (
     get_whisper_config,
@@ -330,6 +331,94 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
     return None
 
 
+def _transcribe_with_deepgram(media_path):
+    key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+    if not key:
+        raise ValueError("DEEPGRAM_API_KEY is not configured")
+
+    wav_path = _extract_wav(media_path)
+    # Deepgram defaults to English when no language is given, and it does not
+    # error on a mismatch: it returns 200 with a near-empty transcript. Pin the
+    # language instead of letting that default through.
+    lang_param = os.environ.get("DEEPGRAM_LANGUAGE", "es").strip() or "es"
+    url = ("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
+           f"&punctuate=true&utterances=true&words=true&language={lang_param}")
+    headers = {
+        "Authorization": f"Token {key}",
+        "Content-Type": "audio/wav",
+    }
+    try:
+        with open(wav_path, "rb") as f:
+            audio_bytes = f.read()
+
+        with httpx.Client(timeout=180.0) as client:
+            resp = client.post(url, headers=headers, content=audio_bytes)
+
+        if resp.status_code != 200:
+            raise Exception(f"Deepgram API error ({resp.status_code}): {resp.text}")
+
+        data = resp.json()
+        results = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0]
+        full_text = results.get("transcript", "")
+        raw_words = results.get("words", [])
+
+        words = []
+        for w in raw_words:
+            w_text = w.get("word", "")
+            if not w_text:
+                continue
+            words.append({
+                "word": " " + w_text if not w_text.startswith(" ") else w_text,
+                "start": float(w.get("start", 0)),
+                "end": float(w.get("end", 0)),
+            })
+
+        utterances = data.get("results", {}).get("utterances", [])
+        out_segments = []
+        if utterances:
+            for utt in utterances:
+                utt_text = utt.get("transcript", "").strip()
+                utt_start = float(utt.get("start", 0))
+                utt_end = float(utt.get("end", 0))
+                seg_words = [w for w in words if utt_start <= w["start"] <= utt_end]
+                out_segments.append({
+                    "start": utt_start,
+                    "end": utt_end,
+                    "text": utt_text,
+                    "words": merge_continuation_words(seg_words),
+                })
+        elif words:
+            out_segments = [{
+                "start": words[0]["start"],
+                "end": words[-1]["end"],
+                "text": full_text,
+                "words": merge_continuation_words(words),
+            }]
+
+        # A 200 with almost no words over minutes of audio means Deepgram did not
+        # understand the audio (wrong language, bad codec), not that the video is
+        # silent. Raise so the caller falls back to whisper, which autodetects --
+        # otherwise the pipeline accepts the empty transcript and silently
+        # degrades to vision-only analysis.
+        duration = float(data.get("metadata", {}).get("duration") or 0)
+        if duration > 60 and len(words) < 10:
+            raise ValueError(
+                f"only {len(words)} word(s) recognised in {duration:.0f}s of audio "
+                f"(language={lang_param}) -- treating as a failed transcription"
+            )
+
+        return {
+            "text": full_text,
+            "language": lang_param,
+            "segments": out_segments,
+        }
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+
 # --- public entry point -----------------------------------------------------
 
 class NoAudioError(Exception):
@@ -362,6 +451,17 @@ def transcribe_media(media_path):
             "speech, so it needs a video with audio.")
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+
+    if backend == "deepgram" or (os.environ.get("DEEPGRAM_API_KEY") and backend != "whisper"):
+        try:
+            print("🎙️ [ASR] Transcribing with Deepgram Nova-2...")
+            transcript = _transcribe_with_deepgram(media_path)
+            print(f"🎙️ [ASR] Deepgram ok: lang={transcript['language']} "
+                  f"segments={len(transcript['segments'])}")
+            return transcript
+        except Exception as e:
+            print(f"⚠️ [ASR] Deepgram failed ({type(e).__name__}: {e}) — "
+                  f"falling back to whisper")
 
     if backend == "parakeet":
         try:

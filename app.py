@@ -4525,6 +4525,7 @@ async def get_social_user(request: Request):
     if not api_key:
          raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
 
+    api_key = api_key.strip()
     url = "https://api.upload-post.com/api/uploadposts/users"
     print(f"🔍 Fetching User ID from: {url}")
     headers = {"Authorization": f"Apikey {api_key}"}
