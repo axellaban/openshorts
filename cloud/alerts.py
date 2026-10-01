@@ -82,6 +82,20 @@ def _cooldown_ok(kind: str) -> bool:
 TELEGRAM_PREFIX = "OPENSHORTS ✂️ - "
 
 
+def user_ref(user_id) -> str:
+    """How a user is named in an operational alert: never by email address.
+
+    These alerts go to Telegram, whose Bot API is operated from outside the EEA
+    with no adequacy decision and no DPA available to us — so the messages must
+    not carry personal data. They used to read "alice@example.com bought +60
+    minutes". The first 8 hex of the account uuid is enough for the operator to
+    find the row (``select * from users where id::text like '3f9a1c2b%'``) and
+    is not, on its own, an identifier of a person to anyone reading the chat.
+    """
+    ref = str(user_id or "").replace("-", "")
+    return f"user {ref[:8]}" if ref else "a user"
+
+
 async def send_telegram(text: str, *, raise_errors: bool = False):
     """Push a plain-text message to the admin's Telegram chat. No-op if unset.
 
@@ -178,6 +192,89 @@ _PROXY_RENOTIFY = 7200              # keep nagging every 2 h while it stays down
 # with it), which would make an HTTPS probe cry wolf. An exhausted balance
 # rejects the request before forwarding, so HTTP still detects the 407.
 _PROXY_PROBE_URL = "http://www.google.com/generate_204"
+# The static pool gets probed against YouTube itself, not google.com: on
+# 28-aug-2026 YouTube refused the static IPs for hours ("Video unavailable" /
+# bot-check) while google.com kept answering 204, so the watcher said UP and
+# every job silently moved to the per-GB proxy ($14 that day). A healthy
+# static must return the watch page with a playable player response; bytes
+# through the statics are flat-rate, so the ~600 KB page is free.
+_STATIC_PROBE_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+_STATIC_OK_MARKERS = ('"playabilityStatus"', '"status":"OK"')
+# The probe has to ask the way the DOWNLOAD asks, or it measures a question
+# nobody in production is asking. Anonymously, a datacenter IP making ~400
+# YouTube hits a day is rate-limited into "Sign in to confirm you're not a
+# bot" — playabilityStatus comes back LOGIN_REQUIRED — while the very same IP
+# serves every real download fine, because those carry these cookies.
+# Measured 8-sep-2026 on all three statics: anonymous LOGIN_REQUIRED, with
+# cookies OK, while proxy_usage showed 119 YouTube jobs on HD-static1 in 24 h
+# and zero paid bytes. Without this the watcher cries wolf every 2 h and the
+# alert tells you money is burning when none is.
+_static_cookie_jar = None
+_static_cookie_src = None
+
+# The cookies themselves are a route: once Google rotates the session they
+# came from, every download is anonymous whatever the file says, the statics
+# get rate-limited into the bot-check one by one and jobs fall to per-GB
+# billing. That is invisible to the pool probe (one IP still answering = UP)
+# and to the ledger alert (it names the IPs, not the session). 30-sep-2026:
+# ~900 MB paid in 70 min, cap hit, and the watcher had said nothing; yt-dlp
+# had been warning "cookies are no longer valid" in every job log. The watch
+# page carries the same signal yt-dlp reads: ytcfg "LOGGED_IN".
+_COOKIE_TARGET = "YouTube session cookies"
+_session_seen = {"logged_in": None}
+
+
+def _note_session(body):
+    """Record what the watch page says about the cookie session, if anything."""
+    import re as _re
+    m = _re.search(r'"LOGGED_IN":(true|false)', body or "")
+    if m:
+        _session_seen["logged_in"] = m.group(1) == "true"
+
+
+def _probe_cookies():
+    """The download's YOUTUBE_COOKIES as a jar httpx can send, or None.
+
+    Parsed once and cached (the probe runs every 30 minutes). Never logged:
+    the blob is a live YouTube session.
+    """
+    global _static_cookie_jar, _static_cookie_src
+    raw = os.environ.get("YOUTUBE_COOKIES", "")
+    if not raw:
+        return None
+    if raw == _static_cookie_src:
+        return _static_cookie_jar
+    jar = None
+    try:
+        import tempfile
+        from http.cookiejar import MozillaCookieJar
+        # Pre-validate: handed a blob that is not a cookie file, the stdlib
+        # prints "http.cookiejar bug!" with a traceback before raising. That
+        # would land in the container log every 30 minutes, so recognise the
+        # shape ourselves (a Netscape record is 7 tab-separated fields).
+        if not any(len(ln.split("\t")) == 7
+                   for ln in raw.splitlines() if ln and not ln.startswith("#")):
+            raise ValueError("not a Netscape cookie file")
+        body = raw if raw.lstrip().startswith("# Netscape") else \
+            "# Netscape HTTP Cookie File\n" + raw
+        path = os.path.join(tempfile.mkdtemp(), "yt_cookies.txt")
+        with open(path, "w") as fh:
+            fh.write(body if body.endswith("\n") else body + "\n")
+        jar = MozillaCookieJar(path)
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        print(f"\u26a0\ufe0f  Static probe could not read YOUTUBE_COOKIES ({type(e).__name__}); "
+              f"probing anonymously, which YouTube bot-checks.")
+        jar = None
+    _static_cookie_src, _static_cookie_jar = raw, jar
+    return jar
+
+
+def _playability(body):
+    """The playabilityStatus value in a watch page, for the alert detail."""
+    import re as _re
+    m = _re.search(r'"playabilityStatus":\{"status":"([A-Z_]+)"', body or "")
+    return m.group(1) if m else "no player response"
 _PROXY_STRIKES = 2                  # consecutive failed probes before alerting
 _watch_down = {}                    # target name -> down-since epoch
 _watch_nag = {}                     # target name -> last-nag epoch
@@ -201,14 +298,39 @@ def _watch_targets():
 
 
 async def _probe_one(proxy):
-    """(ok, detail) for one cheap request through one proxy."""
+    """(ok, detail) for one request through one proxy.
+
+    The paid proxy keeps the plain-HTTP 204 probe (HTTPS through DataImpulse
+    breaks in httpx even when healthy). A static IP is probed against a real
+    YouTube watch page: answering is not enough, the page must carry a
+    playable player response, or the IP is flagged and every download is
+    about to fall through to per-GB billing.
+    """
+    is_paid = proxy == os.environ.get("PROXY_URL", "").strip()
     try:
         import httpx
-        async with httpx.AsyncClient(proxy=proxy, timeout=20) as client:
-            resp = await client.get(_PROXY_PROBE_URL)
-        if resp.status_code < 400:
+        kwargs = {"proxy": proxy, "timeout": 20}
+        if not is_paid:
+            jar = _probe_cookies()
+            if jar is not None:
+                kwargs["cookies"] = jar
+        async with httpx.AsyncClient(**kwargs) as client:
+            resp = await client.get(_PROXY_PROBE_URL if is_paid else _STATIC_PROBE_URL,
+                                    follow_redirects=not is_paid)
+        if resp.status_code >= 400:
+            return False, f"HTTP {resp.status_code}"
+        if is_paid:
             return True, ""
-        return False, f"HTTP {resp.status_code}"
+        body = resp.text or ""
+        if "cookies" in kwargs:
+            _note_session(body)
+        if all(m in body for m in _STATIC_OK_MARKERS):
+            return True, ""
+        # Name what YouTube actually said. "LOGIN_REQUIRED" with cookies
+        # configured means the session expired (rotate them); the old wording
+        # blamed the IP for every case and sent us hunting the wrong thing.
+        return False, (f"YouTube answered but the video is not playable "
+                       f"(playabilityStatus: {_playability(body)})")
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
@@ -219,6 +341,13 @@ def _watch_severity(name):
     safety net, not an outage: the first version of this alert said "jobs
     will keep failing" for that case and read as the platform being down
     (27-aug-2026, a single ReadTimeout on the paid proxy)."""
+    if name == _COOKIE_TARGET:
+        return "🟠", "YouTube session cookies expired", (
+            "YouTube no longer recognises the session in YOUTUBE_COOKIES, so every "
+            "download runs anonymously: the static IPs get bot-checked and jobs fall "
+            "to the PER-GB proxy (and fail once its daily budget is hit). Fix: log in "
+            "to YouTube in a private window, export the cookies, close the window "
+            "without logging out, update YOUTUBE_COOKIES and redeploy.")
     static_down = bool(_watch_down.get(_STATIC_TARGET))
     paid_down = bool(_watch_down.get(_PAID_TARGET))
     other_configured = len(_watch_targets()) > 1
@@ -249,15 +378,18 @@ async def _watch_update(name, ok, detail):
             _watch_nag[name] = 0.0
         return
     _watch_strikes[name] = _watch_strikes.get(name, 0) + 1
+    # A rotated session is deterministic (the same answer on every IP), so
+    # it does not get the benefit of the doubt a flaky proxy gets.
+    strikes = 1 if name == _COOKIE_TARGET else _PROXY_STRIKES
     if not _watch_down.get(name):
-        if _watch_strikes[name] < _PROXY_STRIKES:
+        if _watch_strikes[name] < strikes:
             return  # one miss: wait for the next probe before saying anything
         _watch_down[name] = now
         _watch_nag[name] = now
         icon, headline, impact = _watch_severity(name)
         await send_admin_alert(
             f"{icon} {headline}",
-            f"{impact}\n\nThe {name} failed {_PROXY_STRIKES} probes in a row "
+            f"{impact}\n\nThe {name} failed {strikes} probe(s) in a row "
             f"({_PROXY_PROBE_INTERVAL // 60} min apart). This repeats every 2 h "
             f"until it answers again.\n\nProbe error: {detail[:400]}",
         )
@@ -273,6 +405,14 @@ async def _watch_update(name, ok, detail):
 
 async def proxy_watch_tick():
     """One probe cycle over every configured route."""
+    # Paid-proxy events held back by the ledger's cooldown go out with the
+    # next tick at the latest (cloud/proxy_ledger.flush_alerts).
+    try:
+        from . import proxy_ledger
+        await proxy_ledger.flush_alerts()
+    except Exception:
+        pass
+    _session_seen["logged_in"] = None
     for name, urls in _watch_targets():
         ok, detail = False, "no urls"
         for u in urls:
@@ -280,6 +420,12 @@ async def proxy_watch_tick():
             if ok:
                 break
         await _watch_update(name, ok, detail)
+    # Judged from the watch pages the static probes just fetched with the
+    # cookies attached; nothing to say when no static answered at all.
+    if _probe_cookies() is not None and _session_seen["logged_in"] is not None:
+        await _watch_update(_COOKIE_TARGET, _session_seen["logged_in"],
+                            'watch page ytcfg says "LOGGED_IN":false with the '
+                            'configured cookies attached')
 
 
 async def proxy_watch_loop():

@@ -10,14 +10,16 @@ Design (matches the Stripe implementation planner for this use case):
 import asyncio
 from datetime import datetime, timezone
 
+import httpx
 import stripe
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from .config import settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS, TOPUP_LOOKUP_KEYS
-from . import config, database
-from .models import User, Subscription, CreditTopup, StripeEvent
+from .config import (settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS,
+                     TOPUP_LOOKUP_KEYS, new_subscriber_label)
+from . import analytics, config, database
+from .models import User, Subscription, CreditTopup, StripeEvent, SignupAttribution
 from .auth import get_current_user_required
 
 router = APIRouter()
@@ -181,6 +183,25 @@ async def create_checkout(body: CheckoutRequest, request: Request):
         success_url=f"{fe}/#/account?checkout=success",
         cancel_url=f"{fe}/#/pricing?checkout=cancel",
         allow_promotion_codes=True,
+        # Business customers need their legal name and VAT on the invoice to
+        # deduct the tax, and this is the only place they can ever type them:
+        # nothing in the dashboard asks for fiscal data. Without it every
+        # company is invoiced as an anonymous e-mail address and writes to
+        # support asking for a corrected invoice (ticket #4520), which cannot
+        # be done in place — the invoice is already issued and its customer
+        # data frozen, so it takes a rectificativa in the accounting.
+        # ``customer_update.name`` is required for Checkout to save the name
+        # onto an EXISTING customer (we always pass one); ``address`` saves the
+        # billing address the same way. Not made ``required``: it is shown only
+        # in supported countries and forcing it would add a field to a funnel
+        # that already converts at ~1%.
+        tax_id_collection={"enabled": True},
+        customer_update={"name": "auto", "address": "auto"},
+        # An unpaid session expires after 24 h; recovery makes Stripe hand the
+        # checkout.session.expired webhook a URL that reopens the same cart,
+        # which cloud/lifecycle.py mails once (1,011 of 1,126 sessions to
+        # 27-sep-2026 expired unpaid, none followed up).
+        after_expiration={"recovery": {"enabled": True, "allow_promotion_codes": True}},
         metadata={
             "user_id": str(user.id),
             "kind": entry["kind"],
@@ -253,6 +274,88 @@ async def create_portal(request: Request):
 
 
 # --------------------------------------------------------------------------- #
+# Legal invoices (AgentLedger)
+# --------------------------------------------------------------------------- #
+# Stripe stays the payment processor; the legally valid Spanish invoice is
+# issued by AgentLedger (aikount.com) and surfaced here with signed public
+# links, so the customer never needs the Stripe-hosted PDF. Same flow as
+# Upload-Post: read by stripe_customer_id, and when AgentLedger has nothing yet
+# (just-subscribed user) ask it to import this customer's history on the spot.
+_AGENTLEDGER_TIMEOUT = 8.0
+_AGENTLEDGER_BACKFILL_TIMEOUT = 20.0
+_AGENTLEDGER_BACKFILL_DEBOUNCE_S = 90
+_agentledger_backfill_at: dict[str, float] = {}   # stripe_customer_id -> unix ts
+
+
+def _agentledger_headers() -> dict:
+    return {"Authorization": f"Bearer {settings.agentledger_api_key}"}
+
+
+async def _agentledger_fetch_invoices(client: httpx.AsyncClient, customer_id: str) -> list[dict]:
+    """Invoices for one Stripe customer. 404 = no contact yet → []."""
+    r = await client.get(f"{settings.agentledger_api_url}/contacts/{customer_id}/invoices",
+                         headers=_agentledger_headers(), timeout=_AGENTLEDGER_TIMEOUT)
+    if r.status_code == 404:
+        return []
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Could not load invoices")
+    raw = (r.json() or {}).get("invoices") or []
+    # Project to what the UI needs; tokens stay inside the pre-built URLs.
+    return [{
+        "doc_number": i.get("doc_number") or "",
+        "doc_date": i.get("doc_date") or "",
+        "total": i.get("total") or "0.00",
+        "currency": i.get("currency") or "EUR",
+        "status": i.get("status") or "",
+        "public_url": i.get("public_url") or "",
+        "pdf_url": i.get("pdf_url") or "",
+    } for i in raw]
+
+
+async def _agentledger_backfill(client: httpx.AsyncClient, customer_id: str) -> None:
+    """Best-effort: import this customer's whole paid-invoice history now."""
+    try:
+        await client.post(f"{settings.agentledger_api_url}/integrations/stripe/sync-customer",
+                          json={"treasury_id": settings.agentledger_treasury_id,
+                                "stripe_customer_id": customer_id},
+                          headers=_agentledger_headers(), timeout=_AGENTLEDGER_BACKFILL_TIMEOUT)
+    except httpx.HTTPError:
+        pass
+
+
+@router.get("/api/billing/invoices")
+async def list_invoices(request: Request):
+    """Legal invoices for the signed-in user: ``{"invoices": [{doc_number,
+    doc_date, total, currency, status, public_url, pdf_url}]}``. Free users
+    (no Stripe customer yet) get an empty list, not an error."""
+    user = await get_current_user_required(request)
+    if not settings.agentledger_api_key:
+        raise HTTPException(status_code=503, detail="Billing backend not configured")
+    async with database.session() as session:
+        u = await session.get(User, user.id)
+        customer_id = u.stripe_customer_id if u else None
+    if not customer_id:
+        return {"invoices": []}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            invoices = await _agentledger_fetch_invoices(client, customer_id)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Invoice service unreachable")
+        if not invoices:
+            import time as _time
+            last = _agentledger_backfill_at.get(customer_id, 0.0)
+            if _time.time() - last > _AGENTLEDGER_BACKFILL_DEBOUNCE_S:
+                _agentledger_backfill_at[customer_id] = _time.time()
+                await _agentledger_backfill(client, customer_id)
+                try:
+                    invoices = await _agentledger_fetch_invoices(client, customer_id)
+                except httpx.HTTPError:
+                    invoices = []
+    return {"invoices": invoices}
+
+
+# --------------------------------------------------------------------------- #
 # Webhook
 # --------------------------------------------------------------------------- #
 @router.post("/api/stripe/webhook")
@@ -297,6 +400,15 @@ async def handle_event(event: dict):
     elif etype == "invoice.paid":
         await _set_subscription_status_by_invoice(obj, "active", created)
         await _notify_invoice_paid(obj)
+        await _track_invoice_revenue(obj)
+    elif etype == "charge.refunded":
+        await _track_refund(obj)
+    elif etype == "checkout.session.expired":
+        from . import lifecycle
+        try:
+            await lifecycle.on_checkout_expired(obj)
+        except Exception as e:  # an email must never make Stripe retry the event
+            print(f"⚠️  Checkout recovery email failed: {e}")
 
 
 async def _user_id_for_customer(session, customer_id):
@@ -312,6 +424,7 @@ async def _apply_topup(session_obj: dict):
     if minutes <= 0:
         return
     buyer_email = None
+    acquisition = {}
     async with database.session() as s:
         async with s.begin():
             existing = (await s.execute(
@@ -344,6 +457,7 @@ async def _apply_topup(session_obj: dict):
             buyer_email = (await s.execute(
                 select(User.email).where(User.id == user_id)
             )).scalar_one_or_none()
+            acquisition = await _acquisition_properties(s, user_id)
 
     amount_txt = ""
     total = session_obj.get("amount_total")
@@ -353,6 +467,12 @@ async def _apply_topup(session_obj: dict):
     await send_admin_alert(
         f"💰 Top-up purchased{amount_txt}",
         f"{buyer_email or 'A user'} bought +{minutes} minutes.",
+    )
+    # Mirror the sale into OpenPanel, on the same profile the browser identifies.
+    analytics.track_revenue(
+        user_id, total, session_obj.get("currency"),
+        type="topup", source="openshorts", minutes=minutes,
+        stripe_session_id=session_id, email=buyer_email, **acquisition,
     )
 
 
@@ -380,6 +500,22 @@ def _sub_period(sub_obj: dict):
     start = sub_obj.get("current_period_start") or item.get("current_period_start")
     end = sub_obj.get("current_period_end") or item.get("current_period_end")
     return start, end
+
+
+LIVE_STATUSES = ("active", "trialing")
+
+
+def became_live(prev_status, now_status) -> bool:
+    """The transition that turns a free account into a paid one."""
+    return now_status in LIVE_STATUSES and prev_status not in LIVE_STATUSES
+
+
+async def _unmark_after_upgrade(user_id):
+    try:
+        from . import videos
+        await videos.unmark_user_library(user_id)
+    except Exception as e:
+        print(f"⚠️  Could not unmark the library of {user_id} after upgrade: {e}")
 
 
 async def _upsert_subscription(sub_obj: dict, event_created: datetime):
@@ -446,10 +582,21 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
                     setattr(row, k, v)
 
     # Purchase alert: someone just subscribed (trial started or paid outright).
+    # Not for 'incomplete': Checkout creates the subscription the moment the
+    # user hits pay, before 3DS / the card answer, so that status only says
+    # someone reached the button. About half of them expire unpaid (24 of 53
+    # in the 30 days to 16-sep-2026), and the ones that do pay are announced
+    # by the 'Payment received' alert on invoice.paid, which carries the
+    # amount; a second message here would just be noise.
     now_status = sub_obj["status"]
-    if is_new_sub:
+    if became_live(prev_status, now_status):
+        # The clips this user already made on the free plan lose their
+        # watermark now (cloud/videos): the upgrade modal promised exactly
+        # that. Fire-and-forget: Stripe must get its 200 whatever R2 does.
+        asyncio.create_task(_unmark_after_upgrade(user_id))
+    label = new_subscriber_label(now_status) if is_new_sub else None
+    if label:
         from .alerts import send_admin_alert
-        label = "trial started — card on file" if now_status == "trialing" else now_status
         await send_admin_alert(
             "🎉 New subscriber",
             f"{buyer_email or 'A user'} started the {plan} ({interval}) plan.\nStatus: {label}.",
@@ -465,9 +612,15 @@ async def _upsert_subscription(sub_obj: dict, event_created: datetime):
     if just_canceled:
         from .alerts import send_admin_alert
         from .config import VIDEO_RETENTION_GRACE_DAYS
+        # Cancelled in the Stripe portal, not the dashboard flow (which flips
+        # the row itself and sends its own alert). The portal's reason, if it
+        # asked for one, is the only feedback there is. The comment is free
+        # text and stays out of Telegram (alerts.user_ref).
+        feedback = (sub_obj.get("cancellation_details") or {}).get("feedback")
         await send_admin_alert(
             "🔻 Subscription canceled",
-            f"A {plan} subscriber just canceled.\n"
+            f"A {plan} subscriber just canceled in the Stripe portal"
+            f"{f' (reason: {feedback})' if feedback else ''}.\n"
             f"Access continues until {end_dt:%Y-%m-%d}. Google-authed users then "
             f"drop to the free plan (clips expire after 7 days); others keep their "
             f"videos {VIDEO_RETENTION_GRACE_DAYS} more days before deletion.",
@@ -523,4 +676,99 @@ async def _notify_invoice_paid(invoice_obj: dict):
     await send_admin_alert(
         f"💵 Payment received: {money}",
         f"{email or 'A customer'} — {kind}.",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# OpenPanel revenue mirror
+# --------------------------------------------------------------------------- #
+# The browser fires ``Subscribed`` with the list price when the user comes back
+# from Stripe, but that is an intent signal: it misses renewals entirely, is
+# eaten by ad-blockers and can never see a refund. The webhook is the only
+# place money is known for certain, so every paid invoice, top-up and refund is
+# mirrored here as OpenPanel's native ``revenue`` event. ``profileId`` is the
+# user's uuid — the same id the browser and the job events already use — so
+# the sale lands on the profile that carries their pageviews and ``Signup``.
+
+_INVOICE_REVENUE_TYPE = {
+    "subscription_create": "new",
+    "subscription_cycle": "renewal",
+    "subscription_update": "upgrade",
+    "subscription_threshold": "renewal",
+}
+
+
+async def _acquisition_properties(session, user_id) -> dict:
+    """Never raises: a missing row simply reads as ``channel=direct``."""
+    try:
+        row = await session.get(SignupAttribution, user_id)
+    except Exception:
+        row = None
+    return analytics.acquisition_properties(row)
+
+
+async def _track_invoice_revenue(invoice_obj: dict):
+    try:
+        amount = int(invoice_obj.get("amount_paid") or 0)
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+    cust = invoice_obj.get("customer")
+    if not cust:
+        return
+    async with database.session() as s:
+        user = (await s.execute(
+            select(User.id, User.email).where(User.stripe_customer_id == cust)
+        )).first()
+        if user is None:
+            return
+        user_id, email = user
+        plan = interval = None
+        sub_id = invoice_obj.get("subscription")
+        if sub_id:
+            sub = (await s.execute(
+                select(Subscription.plan, Subscription.interval).where(
+                    Subscription.stripe_subscription_id == sub_id
+                )
+            )).first()
+            if sub is not None:
+                plan, interval = sub
+        acquisition = await _acquisition_properties(s, user_id)
+    reason = invoice_obj.get("billing_reason") or ""
+    analytics.track_revenue(
+        user_id, amount, invoice_obj.get("currency"),
+        type=_INVOICE_REVENUE_TYPE.get(reason, "other"), source="openshorts",
+        plan=plan, interval=interval, billing_reason=reason or None,
+        stripe_invoice_id=invoice_obj.get("id"), email=email, **acquisition,
+    )
+
+
+async def _track_refund(charge_obj: dict):
+    """Negative revenue. ``amount_refunded`` is cumulative across partial
+    refunds, so prefer the newest entry of ``refunds.data`` when Stripe
+    includes it (it is not expanded by default on recent API versions)."""
+    refunds = ((charge_obj.get("refunds") or {}).get("data") or [])
+    raw = refunds[0].get("amount") if refunds else charge_obj.get("amount_refunded")
+    try:
+        amount = int(raw or 0)
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+    cust = charge_obj.get("customer")
+    if not cust:
+        return
+    async with database.session() as s:
+        user = (await s.execute(
+            select(User.id, User.email).where(User.stripe_customer_id == cust)
+        )).first()
+        if user is None:
+            return
+        user_id, email = user
+        acquisition = await _acquisition_properties(s, user_id)
+    analytics.track_revenue(
+        user_id, -amount, charge_obj.get("currency"),
+        type="refund", source="openshorts",
+        stripe_charge_id=charge_obj.get("id"), email=email, **acquisition,
     )

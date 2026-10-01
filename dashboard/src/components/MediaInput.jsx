@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 
 const SUPPORTED_PLATFORMS = [
@@ -7,12 +8,35 @@ const SUPPORTED_PLATFORMS = [
     'Facebook', 'Instagram', 'Dailymotion', 'Reddit', 'Streamable',
 ];
 
+// Mirrors the server's MIN_SOURCE_SECONDS: shorter sources are rejected with a
+// 400 after the whole file was uploaded. Checking the duration in the browser
+// says so the moment the file is picked (a 27 s upload used to end in a bare
+// "That run failed").
+const MIN_SOURCE_SECONDS = 45;
+
+// Duration of a local video file in seconds, or null when the browser cannot
+// read it (unsupported codec): then the server stays the judge.
+const readVideoDuration = (file) => new Promise((resolve) => {
+    try {
+        const url = URL.createObjectURL(file);
+        const v = document.createElement('video');
+        v.preload = 'metadata';
+        const done = (d) => { URL.revokeObjectURL(url); resolve(d); };
+        v.onloadedmetadata = () => done(Number.isFinite(v.duration) ? v.duration : null);
+        v.onerror = () => done(null);
+        setTimeout(() => done(null), 8000);
+        v.src = url;
+    } catch { resolve(null); }
+});
+
 export default function MediaInput({ onProcess, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     // File upload is the primary path; the link is secondary.
     const [mode, setMode] = useState('file'); // 'file' | 'url'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
+    const [fileSeconds, setFileSeconds] = useState(null);
+    const fileTooShort = fileSeconds != null && fileSeconds < MIN_SOURCE_SECONDS;
     const [acknowledged, setAcknowledged] = useState(false);
     const [outputFormat, setOutputFormat] = useState('vertical'); // vertical | horizontal | square
     const [showInfo, setShowInfo] = useState(false);
@@ -28,7 +52,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
         try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
     });
     const [autoHookStyle, setAutoHookStyle] = useState(() => {
-        try { return localStorage.getItem('os_auto_hook_style') || 'classic'; } catch { return 'classic'; }
+        // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
+        try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
     });
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
@@ -47,6 +72,20 @@ export default function MediaInput({ onProcess, isProcessing }) {
         document.addEventListener('mousedown', onClick);
         return () => document.removeEventListener('mousedown', onClick);
     }, [showInfo]);
+
+    useEffect(() => {
+        let cancelled = false;
+        setFileSeconds(null);
+        if (!file) return undefined;
+        readVideoDuration(file).then((d) => {
+            if (cancelled) return;
+            setFileSeconds(d);
+            if (d != null && d < MIN_SOURCE_SECONDS) {
+                track('SourceTooShort', { props: { seconds: String(Math.round(d)) } });
+            }
+        });
+        return () => { cancelled = true; };
+    }, [file]);
 
     useEffect(() => {
         fetch(getApiUrl('/api/config'))
@@ -88,12 +127,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
-            localStorage.setItem('os_auto_hook_style', autoHookStyle);
+            localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
-        } else if (mode === 'file' && file) {
+        } else if (mode === 'file' && file && !fileTooShort) {
             onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
         }
     };
@@ -108,7 +147,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
     return (
         <div className="card p-4 sm:p-6 animate-fade">
-            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule">
+            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule" data-tutorial="source-tabs">
                 <button
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'file'
@@ -135,7 +174,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
             <form onSubmit={handleSubmit}>
                 {mode === 'url' ? (
-                    <div className="space-y-4">
+                    <div className="space-y-4" data-tutorial="drop-zone">
                         <div className="relative">
                             <input
                                 type="url"
@@ -174,6 +213,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 ) : (
                     <div
+                        data-tutorial="drop-zone"
                         className={`border-2 border-dashed rounded-card p-6 sm:p-8 text-center transition-colors ${file ? 'border-brass' : 'border-rule2 hover:border-brass'
                             }`}
                         onDragOver={(e) => e.preventDefault()}
@@ -191,7 +231,14 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     <X size={16} />
                                 </button>
                             </div>
-                        ) : (
+                        ) : null}
+                        {file && fileTooShort ? (
+                            <p className="text-danger text-sm mt-3" role="alert">
+                                This video is {Math.round(fileSeconds)}s long. Clip generation needs at least {MIN_SOURCE_SECONDS}s
+                                of footage to cut from: it already is a short. Pick a longer video.
+                            </p>
+                        ) : null}
+                        {!file && (
                             <label className="cursor-pointer block">
                                 <input
                                     type="file"
@@ -201,14 +248,14 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 />
                                 <Upload className="mx-auto mb-3 text-muted" size={18} />
                                 <p className="text-ink2 lowercase">Click to upload or drag and drop</p>
-                                <p className="readout mt-2">MP4, MOV up to 500MB</p>
+                                <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
                             </label>
                         )}
                     </div>
                 )}
 
                 {/* Output format selector */}
-                <div className="mt-5">
+                <div className="mt-5" data-tutorial="output-format">
                     <p className="eyebrow mb-2">Output format</p>
                     <div className="grid grid-cols-3 gap-2">
                         {[
@@ -324,6 +371,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         onChange={(e) => setAutoHookStyle(e.target.value)}
                                         className="input-field !w-auto text-xs py-1.5"
                                     >
+                                        <option value="pill">Pills</option>
                                         <option value="classic">Classic</option>
                                         <option value="dark">Dark</option>
                                         <option value="yellow">Yellow</option>
@@ -331,6 +379,12 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                         <option value="outline">Outline</option>
                                         <option value="outline_yellow">Outline+</option>
                                     </select>
+                                )}
+                                {autoHook && (
+                                    <p className="w-full text-[11px] leading-relaxed text-muted">
+                                        You can change each clip&apos;s hook text, style, position and size
+                                        afterwards with its hook button.
+                                    </p>
                                 )}
                             </div>
                         </div>
@@ -351,7 +405,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
                 <button
                     type="submit"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && !file)}
+                    data-tutorial="generate"
+                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
                     className="w-full btn-primary mt-4"
                 >
                     {isProcessing ? (

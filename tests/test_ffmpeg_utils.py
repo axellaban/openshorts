@@ -9,6 +9,7 @@ from ffmpeg_utils import (
     METADATA_SCRUB,
     QUALITY,
     QUALITY_FAST,
+    blurred_backdrop,
     mark_ai_generated,
     reset_encoder_cache,
     video_encode_args,
@@ -18,6 +19,7 @@ from ffmpeg_utils import (
 @pytest.fixture(autouse=True)
 def _clean_encoder_state(monkeypatch):
     monkeypatch.delenv("FFMPEG_ENCODER", raising=False)
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
     reset_encoder_cache()
     yield
     reset_encoder_cache()
@@ -143,3 +145,105 @@ def test_ai_disclosure_never_destroys_the_file_it_cannot_tag():
         assert mark_ai_generated(p) is False
         assert open(p, "rb").read() == b"not a video"
         assert not os.path.exists(p + ".aitag.mp4")
+
+
+# --- cut_clip: a failed cut must say why, not hand an empty file downstream ---
+
+class _FakeRun:
+    """Stand-in for subprocess.run that writes what a real ffmpeg would."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)   # (returncode, bytes_written, stderr)
+        self.commands = []
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        returncode, size, stderr = self.outcomes.pop(0)
+        with open(command[-1], "wb") as fh:
+            fh.write(b"\0" * size)
+        return subprocess.CompletedProcess(command, returncode, None, stderr)
+
+
+@pytest.fixture
+def _cut(tmp_path, monkeypatch):
+    """Run cut_clip against a scripted ffmpeg, on the GPU encoder, no waiting."""
+    monkeypatch.setenv("FFMPEG_ENCODER", "auto")
+    monkeypatch.setattr(ffmpeg_utils, "_probe_nvenc", lambda: True)
+    slept = []
+    monkeypatch.setattr(ffmpeg_utils.time, "sleep", slept.append)
+
+    def run(outcomes):
+        fake = _FakeRun(outcomes)
+        monkeypatch.setattr(ffmpeg_utils.subprocess, "run", fake)
+        ffmpeg_utils.cut_clip("source.mp4", str(tmp_path / "temp_clip.mp4"), 1.5, 12.0, 4)
+        return fake
+
+    run.slept = slept
+    return run
+
+
+def test_successful_cut_runs_once(_cut):
+    fake = _cut([(0, 5_000_000, "")])
+    assert len(fake.commands) == 1
+    assert "h264_nvenc" in fake.commands[0]
+
+
+def test_retry_stays_on_the_gpu_after_a_wait(_cut):
+    """No libx264 fallback: the GPU failure is transient, so wait and ask again."""
+    fake = _cut([(1, 0, "OpenEncodeSessionEx failed: out of memory"),
+                 (0, 5_000_000, "")])
+    assert len(fake.commands) == 2
+    assert all("h264_nvenc" in cmd for cmd in fake.commands)
+    assert "libx264" not in fake.commands[1]
+    assert _cut.slept == [ffmpeg_utils.CUT_RETRY_WAITS[0]]
+
+
+def test_exit_zero_with_an_empty_file_is_still_a_failure(_cut):
+    """The prod symptom: ffmpeg wrote nothing, so the reframer met a file with
+    no moov atom and blamed the temp clip instead of the encode."""
+    fake = _cut([(0, 0, ""), (0, 5_000_000, "")])
+    assert len(fake.commands) == 2
+
+
+def test_every_attempt_failing_raises_with_ffmpeg_stderr(_cut):
+    attempts = len(ffmpeg_utils.CUT_RETRY_WAITS) + 1
+    with pytest.raises(RuntimeError, match="Invalid data found"):
+        _cut([(1, 0, "Invalid data found when processing input")] * attempts)
+    assert _cut.slept == list(ffmpeg_utils.CUT_RETRY_WAITS)
+
+
+def test_backdrop_blurs_at_quarter_size_and_fills_the_frame():
+    chain = blurred_backdrop(1080, 1920, 12)
+    assert "scale=-2:480,crop=w=min(iw\\,270):h=480" in chain
+    assert "gblur=sigma=3," in chain
+    assert chain.endswith("scale=1080:1920")
+
+
+def _gpu_source(monkeypatch, codec_pix):
+    monkeypatch.setattr(ffmpeg_utils, "_gpu_cut_sources", {})
+    monkeypatch.setattr(ffmpeg_utils, "_source_format",
+                        lambda path: tuple(codec_pix.split(",")))
+
+
+def test_cut_stays_on_the_gpu_for_8bit_420(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "h264,yuv420p")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert cmd[cmd.index("-hwaccel") + 1] == "cuda"
+    assert cmd[cmd.index("-hwaccel_output_format") + 1] == "cuda"
+    assert "-pix_fmt" not in cmd
+    assert "h264_nvenc" in cmd
+
+
+def test_cut_decodes_10bit_sources_on_the_cpu(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "hevc,yuv420p10le")
+    cmd = _cut([(0, 5_000_000, "")]).commands[0]
+    assert "-hwaccel" not in cmd
+    assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+
+
+def test_failed_gpu_cut_falls_back_to_the_cpu_decode(_cut, monkeypatch):
+    _gpu_source(monkeypatch, "av1,yuv420p")
+    fake = _cut([(1, 0, "cuvid error"), (0, 5_000_000, "")])
+    assert "-hwaccel" in fake.commands[0]
+    assert "-hwaccel" not in fake.commands[1]
+    assert len(fake.commands) == 2

@@ -12,6 +12,7 @@ audio codecs, filters) stay at each call site.
 import os
 import subprocess
 import threading
+import time
 
 # Quality tiers pinning the historical libx264 settings.
 QUALITY = "quality"            # was: -preset medium -crf 18
@@ -205,6 +206,22 @@ def video_encode_args(tier=QUALITY):
     return list((_NVENC_ARGS if use_nvenc else _X264_ARGS)[tier])
 
 
+def blurred_backdrop(out_w, out_h, sigma):
+    """Filter chain (no labels) filling out_w x out_h with a blurred copy.
+
+    The blur runs at a quarter of the output size and is scaled up afterwards:
+    a blurred picture has no detail to lose, the result looks the same (SSIM
+    0.994-0.998 against the full-size gblur on prod clips) and the segment
+    encode needs ~45% less CPU. ``sigma`` is the full-size one.
+    """
+    small_w = max(2, out_w // 4 - (out_w // 4) % 2)
+    small_h = max(2, out_h // 4 - (out_h // 4) % 2)
+    return (
+        f"scale=-2:{small_h},crop=w=min(iw\\,{small_w}):h={small_h},"
+        f"gblur=sigma={sigma / 4:g},scale={out_w}:{out_h}"
+    )
+
+
 def escape_filter_value(value):
     r"""Escape a path/value for use inside a quoted FFmpeg filter argument.
 
@@ -223,3 +240,134 @@ def escape_filter_value(value):
     control this: use a neutral name, never one derived from a video title.
     """
     return value.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
+
+
+# An mp4 that ffmpeg abandoned before writing the moov atom is a few dozen
+# bytes of ftyp, or nothing at all. Anything a real cut produces is orders of
+# magnitude larger, so this only ever catches a failed encode.
+MIN_CUT_BYTES = 1024
+
+# Retries of a failed cut, on the SAME encoder, and how long to wait before
+# each one. Deliberately not a fallback to libx264: the clip has to come out
+# of the GPU like every other one, and a CPU re-encode of a 1080p cut on a box
+# that is already busy enough to have failed the first attempt is the wrong
+# trade. Waiting is the whole mechanism — whatever the GPU could not give this
+# encode, another job finishes and gives back.
+CUT_RETRY_WAITS = (3, 9)
+
+# The cut can stay on the card end to end: NVDEC decodes into GPU memory and
+# NVENC encodes from it, so the CPU never touches a frame. Measured on a real
+# 1080p source: byte-identical decoded frames to the CPU-decoded cut, 64% less
+# CPU (25-sep-2026). Only for 8-bit 4:2:0 in codecs the card decodes: anything
+# else would reach nvenc in a pixel format a delivered H.264 must not have, so
+# it keeps the CPU decode. FFMPEG_GPU_CUT=0 turns it off.
+_GPU_CUT_CODECS = {"h264", "hevc", "vp9", "av1"}
+_gpu_cut_sources = {}
+
+
+def _source_format(path):
+    """(codec, pix_fmt) of the first video stream, or None."""
+    if not os.path.exists(path):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,pix_fmt", "-of", "csv=p=0", path],
+            stderr=subprocess.DEVNULL, timeout=60, text=True).strip()
+        codec, pix_fmt = out.split(",")[:2]
+        return codec, pix_fmt
+    except Exception:
+        return None
+
+
+def _gpu_cut_ok(input_video):
+    if os.environ.get("FFMPEG_GPU_CUT", "1").strip() == "0":
+        return False
+    if os.environ.get("FFMPEG_ENCODER", "x264").strip().lower() not in ("nvenc", "auto"):
+        return False
+    if input_video not in _gpu_cut_sources:
+        fmt = _source_format(input_video) if nvenc_available() else None
+        _gpu_cut_sources[input_video] = bool(
+            fmt and fmt[0] in _GPU_CUT_CODECS and fmt[1] == "yuv420p")
+    return _gpu_cut_sources[input_video]
+
+
+def cut_clip(input_video, clip_temp_path, start, end, clip_number):
+    """Cut [start, end] out of the source into ``clip_temp_path``.
+
+    Raises RuntimeError with ffmpeg's own stderr when the cut does not produce
+    a playable file. That report is the point: since dec-2025 the cut ran with
+    its return code ignored and stderr captured into a pipe nobody read, so a
+    failed cut handed an empty file to the reframer and the job's only visible
+    error was "moov atom not found" three layers downstream — from ffmpeg,
+    TransNetV2 and PySceneDetect in turn, each naming the temp file rather
+    than the encode that never wrote it (prod, 9-sep-2026: three clips of one
+    job lost, cause unrecoverable because the stderr had been discarded).
+
+    A failed cut is retried on the same encoder after a wait. The failure this
+    exists for is transient: the same command, on the same source file, cut
+    fine by hand minutes later, and the nvenc probe is a 256x256 lavfi frame
+    cached for the life of the process, so it stays true while a real 1080p
+    session cannot allocate on a GPU that other jobs are filling.
+    """
+    encode_args = video_encode_args(QUALITY_FAST)
+    command = [
+        'ffmpeg', '-y',
+        '-ss', str(start),
+        '-to', str(end),
+        '-i', input_video,
+        *encode_args,
+        *audio_encode_args(),
+        clip_temp_path
+    ]
+    gpu_command = None
+    if _gpu_cut_ok(input_video):
+        # CUDA frames are already 4:2:0 (nv12); -pix_fmt would force a copy
+        # back to system memory.
+        gpu_args = list(encode_args)
+        if "-pix_fmt" in gpu_args:
+            i = gpu_args.index("-pix_fmt")
+            del gpu_args[i:i + 2]
+        gpu_command = ['ffmpeg', '-y', '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
+                       '-ss', str(start), '-to', str(end), '-i', input_video,
+                       *gpu_args, *audio_encode_args(), clip_temp_path]
+
+    def _run_one(cmd):
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True, errors="replace")
+        # ffmpeg has been seen exiting 0 having written nothing, so the file
+        # itself is the verdict, not just the return code.
+        size = os.path.getsize(clip_temp_path) if os.path.exists(clip_temp_path) else 0
+        ok = result.returncode == 0 and size >= MIN_CUT_BYTES
+        return ok, f"exit {result.returncode}, {size} bytes\n{(result.stderr or '').strip()[-800:]}"
+
+    def _run():
+        nonlocal gpu_command
+        if gpu_command:
+            ok, report = _run_one(gpu_command)
+            if ok:
+                return ok, report
+            # Not worth a second try on this source: back to the CPU decode.
+            print(f"   ⚠️ GPU cut of clip {clip_number} failed — decoding on the CPU.")
+            gpu_command = None
+            _gpu_cut_sources[input_video] = False
+        return _run_one(command)
+
+    for attempt, wait in enumerate(CUT_RETRY_WAITS + (None,), start=1):
+        ok, report = _run()
+        if ok:
+            if attempt > 1:
+                print(f"   ✅ Clip {clip_number} cut on attempt {attempt}.")
+            return
+        if wait is None:
+            break
+        print(f"   ⚠️ Cut of clip {clip_number} failed ({report}) — "
+              f"retrying in {wait}s.")
+        time.sleep(wait)
+
+    raise RuntimeError(
+        f"ffmpeg could not cut clip {clip_number} ({start}s-{end}s) from "
+        f"{os.path.basename(input_video)} in {len(CUT_RETRY_WAITS) + 1} "
+        f"attempts: {report}")
+
+

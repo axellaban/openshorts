@@ -26,17 +26,27 @@ def setup_sync(app):
     from starlette.middleware.sessions import SessionMiddleware
     app.add_middleware(SessionMiddleware, secret_key=settings.jwt_secret)
 
-    from . import auth, oauth, billing, social_profiles, videos, api_keys, account, mcp_oauth
+    from . import (auth, oauth, billing, social_profiles, videos, api_keys,
+                   account, mcp_oauth, marketing, autopilot, lifecycle, cancellation, onboarding)  # noqa: F401
     oauth.register()
     billing._init_stripe()
     app.include_router(auth.router)
     app.include_router(oauth.router)
     app.include_router(billing.router)
+    # Cancel flow with reason + review (the portal can still cancel too).
+    app.include_router(cancellation.router)
+    # Sign-up survey: source, what they came to make, who they are.
+    app.include_router(onboarding.router)
     app.include_router(social_profiles.router)
     app.include_router(videos.router)
     app.include_router(api_keys.router)
     app.include_router(mcp_oauth.router)
     app.include_router(account.router)
+    # Autopilot: clip new videos from the user's connected YouTube channel.
+    app.include_router(autopilot.router)
+    # Unsubscribe from commercial email (LSSI art. 21.2): the out-of-minutes
+    # upsell and the lifecycle emails (cloud/lifecycle.py).
+    app.include_router(marketing.router)
 
 
 async def setup_async(app, keep_reservation_ids=None):

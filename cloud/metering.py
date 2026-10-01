@@ -20,6 +20,7 @@ import asyncio
 import json
 import math
 import os
+from urllib.parse import urlparse
 import random
 import subprocess
 from datetime import datetime, timezone, timedelta
@@ -28,7 +29,7 @@ from decimal import Decimal
 from sqlalchemy import select, update, func, and_
 
 from . import config, database
-from .models import User, Subscription, CreditTopup, UsageLedger
+from .models import User, Subscription, CreditTopup, UsageLedger, FirstVideoGrant
 
 
 SWEEP_INTERVAL_SECONDS = 15 * 60
@@ -64,6 +65,83 @@ def probe_file_minutes(path: str) -> float:
     return seconds / 60.0
 
 
+# Errors on a free (static) route that a different IP could fix. Only these
+# justify spending the per-GB proxy on the same URL; a private, removed or
+# members-only video fails the same on every IP, and a live stream has no
+# duration anywhere. Before this list every one of those went to the paid
+# proxy twice (both extractors), ~1.7 MB a time — the "1.76 MB, 2 requests"
+# rows that filled the DataImpulse panel on 31-aug-2026.
+_IP_SPECIFIC_HINTS = (
+    "sign in to confirm you", "not a bot", "http error 403", "http error 429",
+    "http error 407", "http error 502", "http error 503", "proxyerror",
+    "tunnel connection failed", "connection reset", "timed out", "timeout",
+    "unable to download webpage", "unable to download api page",
+    # "Video unavailable" looks like a content error but is NOT reliable on
+    # the static pool: on 1-sep-2026 five videos "unavailable" on all three
+    # Decodo IPs downloaded fine through the residential proxy (proxy_usage
+    # rows 19:33-07:07). YouTube serves a fake unavailable to IPs it dislikes
+    # — the same symptom as the 19-aug server-IP ban. A truly dead link costs
+    # ~3 MB to re-check; a real video wrongly refused costs the job.
+    "video unavailable",
+    "remote end closed", "connection refused", "network is unreachable",
+    "name or service not known", "eof occurred",
+)
+_CONTENT_HINTS = (
+    "private video", "has been removed", "members-only",
+    "join this channel", "not available on this app", "is not a valid url",
+    "unsupported url", "no video formats found", "premieres in", "will begin in",
+    "this live event", "no duration in metadata", "requested format is not available",
+    "account has been terminated", "video is age", "confirm your age",
+    # An uploader's country block: the residential pool exits from the same
+    # blocked countries, so the paid probe failed with the identical error in
+    # 5 of the 6 cases between 3-sep and 5-sep-2026 (3.6 MB each, and the
+    # Telegram alert claimed the paid proxy "answered").
+    "available in your country", "in your country", "geo-restricted", "geoblock",
+    "blocked it in your country",
+)
+
+
+def static_failure_warrants_paid(err) -> bool:
+    """Does this failure on a free route justify retrying through the paid proxy?"""
+    e = str(err or "").lower()
+    if any(h in e for h in _CONTENT_HINTS):
+        return False
+    return any(h in e for h in _IP_SPECIFIC_HINTS)
+
+
+# Paid-probe events queued for app.py (thread-safe enough: appended from the
+# executor thread that runs the probe, drained on the event loop).
+_paid_probe_events: list = []
+
+# URLs whose probe saw EVERY static IP answer the bot-check and the paid proxy
+# answer the video. Since 30-sep-2026 that verdict is per video and identical
+# on every one of our IPs (measured: 9 of 10 videos, 3 statics + the server's
+# own IP, twice each), so the download repeating the four anonymous attempts
+# costs ~8 s and four more hits on IPs YouTube is already scoring, for the
+# same answer. app.py pops the verdict when it builds the job.
+_static_bot_verdicts: set = set()
+
+
+def pop_statics_bot_checked(url) -> bool:
+    """True (once) when the probe of ``url`` found the static pool bot-checked
+    for this video and had to use the paid proxy."""
+    try:
+        _static_bot_verdicts.remove(url)
+        return True
+    except KeyError:
+        return False
+
+
+def _all_bot_checked(static_errors) -> bool:
+    return bool(static_errors) and all(
+        "not a bot" in (e or "") for e in static_errors.values())
+
+
+def pop_paid_probe_events() -> list:
+    out, _paid_probe_events[:] = list(_paid_probe_events), []
+    return out
+
+
 def plan_probe_proxies(direct_first, statics, paid):
     """Ordered proxies for a metadata probe — pure, unit-tested.
 
@@ -87,14 +165,19 @@ def plan_probe_proxies(direct_first, statics, paid):
     return order
 
 
-def probe_url_minutes(url: str) -> float:
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return host in ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+                    "music.youtube.com") or host.endswith(".youtube.com")
+
+
+def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     """Return the video duration in minutes from yt-dlp metadata (no download).
 
     Uses the same proxy order + extractor settings as the actual download
     (main.py) so the probe behaves consistently with it and bills the same way.
     Raises ValueError if the duration is unknown (e.g. live streams).
     """
-    import yt_dlp
     # SSRF guard: reject non-http(s) / private / metadata hosts before probing.
     from security_utils import assert_public_url
     assert_public_url(url)
@@ -102,20 +185,33 @@ def probe_url_minutes(url: str) -> float:
     # the live one so the probe sees the file and not an HTML page.
     import file_hosts
     url = file_hosts.resolve(url)
+    # Free and first: a search / playlist / channel page is walked entry by
+    # entry by yt-dlp and never yields a duration (yt_clients.youtube_non_video_reason).
+    from yt_clients import NotASingleVideo, youtube_non_video_reason
+    reason = youtube_non_video_reason(url)
+    if reason:
+        raise NotASingleVideo(f"This link is {reason}.")
 
     bgutil_http = os.environ.get("BGUTIL_BASE_URL", "").strip()
     bgutil_script = os.environ.get("BGUTIL_SCRIPT_PATH", "").strip()
-    conservative = {"youtube": {"player_client": ["tv_embed", "android", "mweb", "web"],
-                                "player_skip": ["webpage", "configs"]}}
-    # Try the bgutil/HD extractor first (http or baked-in script), then the
-    # conservative one — mirrors the download's HD→fallback logic.
-    if bgutil_http:
-        hd = [{"youtubepot-bgutilhttp": {"base_url": [bgutil_http]}}]
-    elif bgutil_script:
-        hd = [{"youtubepot-bgutilscript": {"script_path": [bgutil_script]}}]
-    else:
-        hd = []
-    strategies = hd + [conservative]
+    # Same client lists as the download (yt_clients.py): the authed defaults
+    # alone answer "Video unavailable" for a share of videos on every IP, and
+    # each of those probes then paid the per-GB proxy for nothing.
+    from yt_clients import hd_extractor_args, fallback_extractor_args
+    hd_args = hd_extractor_args(bgutil_http, bgutil_script)
+    # (extractor args, send the account cookies). The second attempt on each
+    # route drops the cookies, exactly like the download's 'fallback-static'
+    # step (main.py): with the cookies attached YouTube answers UNPLAYABLE for
+    # every client — web_embedded, tv_downgraded, web AND mweb — on a share of
+    # videos, and yt-dlp reports that as "Video unavailable" (measured in prod
+    # 9-sep-2026, all three statics, same video anonymous → 1080p 137+140).
+    # Without this step the probe read that as an IP problem and escalated to
+    # the per-GB proxy, which carries the same cookies and fails identically,
+    # while the download quietly recovered anonymously on the same static.
+    # With no HD path at all (self-host, no PO token provider) the fallback is
+    # the only attempt, so it keeps the cookies the operator configured.
+    strategies = ([(hd_args, True)] if hd_args else []) + [
+        (fallback_extractor_args(bgutil_http, bgutil_script), not hd_args)]
 
     # Rotated per probe to spread load across the pool, like the download does.
     statics = [p.strip() for p in
@@ -123,29 +219,92 @@ def probe_url_minutes(url: str) -> float:
     if statics:
         k = random.randrange(len(statics))
         statics = statics[k:] + statics[:k]
+    paid = os.environ.get("PROXY_URL", "").strip()
+    if not allow_paid:
+        paid = ""  # daily budget hit (cloud/proxy_ledger.budget_exceeded)
+    # Same rule as the download plan: a non-YouTube URL never touches the
+    # per-GB proxy (main.plan_download_attempts, youtube=False). Twitch, Kick,
+    # Rumble, product pages and drive links were all reaching it here.
+    if not is_youtube_url(url):
+        paid = ""
     proxies = plan_probe_proxies(
         os.environ.get("DIRECT_FIRST", "").strip() == "1",
         statics,
-        os.environ.get("PROXY_URL", "").strip(),
+        paid,
     )
+    static_errors: dict = {}
 
-    # A dead route in the chain is routine (the proxy watcher is what reports
-    # it, on Telegram); yt-dlp printing a full ERROR block per failed proxy per
-    # strategy would just flood the API log. The reason still reaches the caller
-    # through ``last_err`` below.
+    # Same cookies + PO token the download uses: an anonymous probe gets
+    # "Sign in to confirm you're not a bot" from the static IPs (4-sep-2026,
+    # all three, ~10 probes/day paying 1.8 MB each on the per-GB proxy)
+    # while the authenticated download sails through the same IPs.
+    cookies_env = os.environ.get("YOUTUBE_COOKIES")
+    ck_path = None
+    if cookies_env:
+        import tempfile
+        fd, ck_path = tempfile.mkstemp(prefix="probe_ck_", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(cookies_env)
+    try:
+        return _probe_with_proxies(url, proxies, strategies, static_errors,
+                                   paid, ck_path)
+    finally:
+        if ck_path:
+            try:
+                os.remove(ck_path)
+            except OSError:
+                pass
+
+
+def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
+    """Walk the proxy chain (outer) x extractor strategies (inner) until one
+    reports a duration. Split out of ``probe_url_minutes`` so the temporary
+    cookie file has one obvious lifetime.
+
+    A dead route in the chain is routine (the proxy watcher is what reports it,
+    on Telegram); yt-dlp printing a full ERROR block per failed proxy per
+    strategy would just flood the API log, hence the quiet logger. The reason
+    still reaches the caller through ``last_err``.
+    """
+    import yt_dlp
+
     class _QuietLogger:
         def debug(self, msg): pass
         def info(self, msg): pass
         def warning(self, msg): pass
         def error(self, msg): pass
 
-    # Proxies outer, strategies inner: the paid proxy is only reached once every
-    # free route has failed on both extractors.
     last_err = None
     for proxy in proxies:
-        for extractor_args in strategies:
+        is_paid = bool(paid) and proxy == paid
+        # Every attempt's error on this route, not just the last one. The
+        # anonymous retry (see probe_url_minutes) on a static IP routinely
+        # ends in "Sign in to confirm you're not a bot"; if the attempt with
+        # the cookies had already said "confirm your age" / "Private video",
+        # that is the verdict, and the bot-check must not turn it into an IP
+        # problem worth the paid proxy (17-sep-2026, 3QFAEqE9-Kk, twice).
+        route_errors = []
+        if is_paid:
+            # Only spend the per-GB proxy when a free route failed for a
+            # reason another IP can fix. Content errors and "no duration"
+            # (live streams) are the same on every IP.
+            if not static_errors or not any(static_failure_warrants_paid(e)
+                                            for e in static_errors.values()):
+                break
+        for step, (extractor_args, use_cookies) in enumerate(strategies):
+            # noplaylist: a URL pasted from a playing playlist or a mix
+            # (`watch?v=X&list=...`) is that ONE video. Without this yt-dlp
+            # walks the whole list and fails on its first private / age-gated
+            # / bot-checked entry, a video the user never asked for; the probe
+            # then escalated to the per-GB proxy, which walked the same list
+            # and failed the same way, and the user got a 400 for a valid
+            # link. 26 of the 37 paid probes between 7 and 17-sep-2026 were
+            # exactly this (proxy_usage: `list=` and `results?search_query`).
             opts = {"skip_download": True, "quiet": True, "no_warnings": True,
+                    "noplaylist": True,
                     "logger": _QuietLogger(), "extractor_args": extractor_args}
+            if ck_path and use_cookies:
+                opts["cookiefile"] = ck_path
             if proxy:
                 opts["proxy"] = proxy
             try:
@@ -153,6 +312,12 @@ def probe_url_minutes(url: str) -> float:
                     info = ydl.extract_info(url, download=False)
                 duration = info.get("duration")
                 if duration:
+                    if is_paid:
+                        _paid_probe_events.append({
+                            "url": url, "static_errors": dict(static_errors),
+                            "bytes_estimate": 1_800_000 * (1 + step)})
+                        if _all_bot_checked(static_errors):
+                            _static_bot_verdicts.add(url)
                     return float(duration) / 60.0
                 last_err = ValueError("no duration in metadata")
                 if info.get("extractor") == "generic":
@@ -162,9 +327,19 @@ def probe_url_minutes(url: str) -> float:
                     break
             except Exception as e:
                 last_err = e
+                route_errors.append(str(e)[:300])
         else:
+            if not is_paid:
+                static_errors[_route_name(proxy, proxies)] = (
+                    " || ".join(route_errors) if route_errors else str(last_err)[:300])
             continue
         break
+    if paid and any(p == paid for p in proxies) and static_errors and \
+            any(static_failure_warrants_paid(e) for e in static_errors.values()) and last_err is not None \
+            and not isinstance(last_err, ValueError):
+        # The paid route was tried and failed too: still worth a trail line.
+        _paid_probe_events.append({"url": url, "static_errors": dict(static_errors),
+                                   "bytes_estimate": 3_600_000, "paid_failed": str(last_err)[:200]})
     # Direct file URLs (agent uploads on tmpfiles/uguu/R2, a CDN mp4): ffprobe
     # fetches just the moov atom via range requests. Also the last resort for
     # any URL yt-dlp could not size.
@@ -175,6 +350,16 @@ def probe_url_minutes(url: str) -> float:
     except Exception as e:
         last_err = e
     raise ValueError(f"Could not determine video duration ({last_err})")
+
+
+def _route_name(proxy, proxies) -> str:
+    if proxy is None:
+        return "direct"
+    statics = [p for p in proxies if p is not None]
+    try:
+        return f"static{statics.index(proxy) + 1}"
+    except ValueError:
+        return "proxy"
 
 
 def _ffprobe_url_seconds(url: str, timeout: int = 30) -> float:
@@ -226,6 +411,11 @@ def free_plan_eligible(user) -> bool:
     """
     if user is None or config.FREE_PLAN_MINUTES <= 0:
         return False
+    # Denied accounts (re-registered after an erasure, temp-mail MX): no free
+    # minutes whatever the sign-in method. getattr: test doubles and rows
+    # loaded before the column existed.
+    if getattr(user, "free_plan_denied", None):
+        return False
     if user.google_sub:
         return True
     # Email account: eligible unless the domain is disposable.
@@ -249,10 +439,18 @@ def free_period_end(now: datetime | None = None) -> datetime:
 
 
 async def is_free_user(session, user_id) -> bool:
-    """Google-authed user currently on the free plan (no active/trialing sub)."""
+    """User currently on the free tier (no active/trialing sub).
+
+    Used by the retention sweeps: an account whose free minutes were withdrawn
+    (``free_plan_denied``) still keeps its library on the free 7-day expiry,
+    not forever.
+    """
     if await _active_subscription(session, user_id):
         return False
-    return free_plan_eligible(await session.get(User, user_id))
+    user = await session.get(User, user_id)
+    if user is not None and getattr(user, "free_plan_denied", None):
+        return True
+    return free_plan_eligible(user)
 
 
 async def _plan_used_this_period(session, user_id, period_end) -> Decimal:
@@ -264,6 +462,64 @@ async def _plan_used_this_period(session, user_id, period_end) -> Decimal:
         ))
     )).scalar_one()
     return _D(total)
+
+
+async def has_processed_before(user_id) -> bool:
+    """True once the account has any live (reserved/committed) process job.
+
+    Released reservations (a job that failed or never started) don't count, so
+    a first video that errors out keeps the first-video grant for the retry.
+    """
+    async with database.session() as session:
+        row = (await session.execute(
+            select(UsageLedger.id).where(and_(
+                UsageLedger.user_id == user_id,
+                UsageLedger.job_type == "process",
+                UsageLedger.status.in_(("reserved", "committed")),
+            )).limit(1)
+        )).first()
+    return row is not None
+
+
+def ip_fingerprint(ip) -> str:
+    """HMAC of a client IP (keyed on the app secret), or "" when unknown."""
+    import hashlib
+    import hmac
+    if not ip or ip == "unknown":
+        return ""
+    key = (config.settings.jwt_secret or "openshorts").encode()
+    return hmac.new(key, f"ip:{ip}".encode(), hashlib.sha256).hexdigest()
+
+
+async def ip_had_first_video(ip_hash: str) -> bool:
+    """True when this network already got a live first-video grant inside
+    ``FIRST_VIDEO_IP_WINDOW_DAYS``."""
+    if not ip_hash:
+        return False
+    since = _now() - timedelta(days=config.FIRST_VIDEO_IP_WINDOW_DAYS)
+    async with database.session() as session:
+        row = (await session.execute(
+            select(FirstVideoGrant.id)
+            .join(UsageLedger, UsageLedger.job_id == FirstVideoGrant.job_id)
+            .where(and_(
+                FirstVideoGrant.ip_hash == ip_hash,
+                FirstVideoGrant.created_at >= since,
+                UsageLedger.status.in_(("reserved", "committed")),
+            )).limit(1)
+        )).first()
+    return row is not None
+
+
+async def record_first_video(ip_hash: str, job_id: str):
+    """Remember a first-video grant for this network; prune expired rows."""
+    if not ip_hash:
+        return
+    from sqlalchemy import delete
+    since = _now() - timedelta(days=config.FIRST_VIDEO_IP_WINDOW_DAYS)
+    async with database.session() as session:
+        async with session.begin():
+            await session.execute(delete(FirstVideoGrant).where(FirstVideoGrant.created_at < since))
+            session.add(FirstVideoGrant(ip_hash=ip_hash, job_id=job_id))
 
 
 async def _topups_fifo(session, user_id):
