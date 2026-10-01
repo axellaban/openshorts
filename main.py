@@ -1850,7 +1850,7 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 # OpenAI-compatible servers: model still loading, busy, or a
                 # small model that skipped a required field this time.
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
+                'validation error', 'timed out', 'timeout', 'Timeout'))
             if attempt == max_attempts or not transient:
                 raise
             wait = 5 * (2 ** (attempt - 1))
@@ -1920,7 +1920,7 @@ def get_viral_clips(transcript_result, video_duration):
             print("❌ Error: GEMINI_API_KEY not found in environment variables "
                   "(set it, or point LLM_BASE_URL at an OpenAI-compatible server).")
             return None
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={"timeout": 120000.0})
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"\U0001f916  Model: {model_name} | language: {language}")
 
@@ -1963,7 +1963,9 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        for batch in score_batches(windows, SCORE_BATCH):
+        batches_list = list(score_batches(windows, SCORE_BATCH))
+        for b_idx, batch in enumerate(batches_list, 1):
+            print(f"   🤖 Scoring batch {b_idx}/{len(batches_list)} ({len(batch)} windows)...")
             scored.extend(_run_stage_split(
                 client, model_name, batch, _score_prompt,
                 gemini_worker.ScoreResponse, "windows", costs, "score"))
@@ -2101,7 +2103,7 @@ def get_visual_clips(video_path, video_duration, language="en"):
         else:
             print("❌ Error: GEMINI_API_KEY not found.")
         return None
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"timeout": 120000.0})
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     print(f"🎥  Model: {model_name} | uploading {os.path.basename(video_path)}…")
 
